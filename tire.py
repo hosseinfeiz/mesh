@@ -4,375 +4,267 @@ from scipy.optimize import differential_evolution
 import pyvista as pv
 import warnings
 
-# Suppress trimesh warnings for cleaner output
-warnings.filterwarnings('ignore')
+warnings.filterwarnings('ignore')  # Suppress trimesh warnings
 
 def compute_primitive_invariants(vertices):
     """
-    Compute scaling-free, rotation, and translation invariant primitive moments 
-    for a 3D object based on a set of generating functions.
-    
-    Args:
-        vertices (np.ndarray): Nx3 array of vertex coordinates.
-    
-    Returns:
-        dict: Dictionary containing the computed primitive invariants.
+    Compute rotation, translation, and scale-invariant primitive moments.
     """
-    # Center the vertices to achieve translation invariance
+    # Center vertices for translation invariance
     centroid = np.mean(vertices, axis=0)
-    centered_vertices = vertices - centroid
+    centered = vertices - centroid
 
-    # Compute raw moments up to the third order
-    moment2 = np.sum(centered_vertices**2, axis=0)  # Second-order moments
-    moment3 = np.sum(centered_vertices**3, axis=0)  # Third-order moments
+    # Compute second and third order moments
+    m2 = np.sum(centered**2, axis=0)
+    m3 = np.sum(centered**3, axis=0)
 
-    # Define primitive invariants by combining moments
-    primitives = {
-        "IP1": moment2[0] + moment2[1] + moment2[2],
-        "IP2": moment2[0] * moment2[1] + moment2[1] * moment2[2] + moment2[0] * moment2[2],
-        "IP3": moment2[0] * moment2[1] * moment2[2] - np.sum(centered_vertices[:, 0] * centered_vertices[:, 1] * centered_vertices[:, 2]),
-        "IP4": (moment3[0] + moment3[1]) * (moment2[0] * moment2[1] + moment2[1] * moment2[2] + moment2[0] * moment2[2]),
-        "IP5": moment2[0] * moment3[1] - moment2[1] * moment3[2] + moment2[2] * moment3[0],
-        "IP6": moment3[0]**2 + moment3[1]**2 + moment3[2]**2,
-        "IP7": moment2[0] * (moment3[1] + moment3[2]) - moment3[0] * moment2[1],
+    # Define invariants
+    I1 = m2[0] + m2[1] + m2[2]
+    I2 = m2[0]*m2[1] + m2[1]*m2[2] + m2[0]*m2[2]
+    I3 = m2[0]*m2[1]*m2[2] - np.sum(centered[:, 0]*centered[:, 1]*centered[:, 2])
+    I4 = np.sum(m3)
+    I5 = m2[0]*m3[1] - m2[1]*m3[2] + m2[2]*m3[0]
+    I6 = np.sum(m3**2)
+    I7 = m2[0]*(m3[1] + m3[2]) - m3[0]*m2[1]
+
+    # Normalize invariants to make them scale-invariant
+    invariants = {
+        'I1': 1.0,  # Normalized to 1
+        'I2': I2 / (I1**2),
+        'I3': I3 / (I1**3),
+        'I4': I4 / (I1**1.5),
+        'I5': I5 / (I1**2.0),
+        'I6': I6 / (I1**3.0),
+        'I7': I7 / (I1**2.5)
     }
 
-    return primitives
+    return invariants
 
-def get_reference_cylinder_primitive_invariants():
+def get_reference_invariants():
     """
-    Compute primitive invariants for a reference cylinder for comparison.
-    
-    Returns:
-        dict: Primitive invariants for the reference cylinder.
+    Generate reference cylinder invariants scaled to match the normalized mesh.
     """
-    # Create a reference cylinder
-    cylinder = trimesh.creation.cylinder(radius=1.0, height=2.0, sections=32)
-    vertices = cylinder.vertices
+    # Create a cylinder with radius=0.5 and height=1.0 to match the normalized mesh
+    cylinder = trimesh.creation.cylinder(radius=0.5, height=1.0, sections=32)
+    invariants = compute_primitive_invariants(cylinder.vertices)
 
-    # Compute primitive invariants
-    primitives = compute_primitive_invariants(vertices)
+    # Add some tolerance for matching (10% of the invariant values)
+    return {k: {'mean': v, 'std': abs(v * 0.1)} for k, v in invariants.items()}
 
-    return primitives
-
-def load_and_preprocess_mesh(mesh_file):
+def extract_cylinder_submesh(mesh, params):
     """
-    Load and preprocess the mesh: remove unreferenced vertices, center, and normalize.
-
+    Extract submesh within a cylinder defined by parameters.
     Parameters:
-        mesh_file (str): Path to the mesh file.
-
-    Returns:
-        trimesh.Trimesh: Preprocessed mesh.
+        params: [x, y, z, radius, height]
     """
-    mesh = trimesh.load(mesh_file, force='mesh')
+    x, y, z, radius, height = params
+    center = np.array([x, y, z])
 
+    # Transform vertices to cylinder space
+    local_verts = mesh.vertices - center
 
+    # Check which vertices are within cylinder bounds
+    r_squared = local_verts[:, 0]**2 + local_verts[:, 2]**2  # XZ plane radius
+    in_radius = r_squared <= radius**2
+    in_height = (local_verts[:, 1] >= -height/2) & (local_verts[:, 1] <= height/2)
+    vertex_mask = in_radius & in_height
 
+    if not np.any(vertex_mask):
+        return None
 
-    # Remove unreferenced vertices
-    mesh.remove_unreferenced_vertices()
+    # Get faces where all vertices are inside cylinder
+    vertex_indices = np.where(vertex_mask)[0]
+    face_mask = np.all(np.isin(mesh.faces, vertex_indices), axis=1)
 
-    # Center the mesh
+    if not np.any(face_mask):
+        return None
+
+    # Create submesh
+    faces = mesh.faces[face_mask]
+    vertices = mesh.vertices[vertex_mask]
+
+    # Reindex faces
+    index_map = {old: new for new, old in enumerate(vertex_indices)}
+    try:
+        new_faces = np.array([[index_map[vid] for vid in face] for face in faces])
+    except KeyError:
+        return None
+
+    try:
+        submesh = trimesh.Trimesh(vertices=vertices, faces=new_faces, process=False)
+        if not submesh.is_watertight:
+            submesh = submesh.convex_hull
+        return submesh
+    except:
+        return None
+
+def optimization_loss(params, mesh, target_invariants):
+    """
+    Compute loss between submesh and target invariants.
+    """
+    submesh = extract_cylinder_submesh(mesh, params)
+    if submesh is None or len(submesh.vertices) < 20:
+        return 1e6
+
+    current = compute_primitive_invariants(submesh.vertices)
+
+    # Compute normalized differences
+    loss = sum(
+        abs(current[k] - target_invariants[k]['mean']) / target_invariants[k]['std']
+        for k in current
+    )
+
+    # Penalize very small or very large submeshes
+    volume_penalty = abs(1 - len(submesh.vertices) / 500)
+    return loss + volume_penalty
+
+def detect_cylinders(mesh, max_cylinders=5, error_threshold=10.0):
+    """
+    Find multiple cylindrical submeshes in the input mesh.
+    """
+    # Normalize mesh
     mesh.vertices -= mesh.centroid
-
-    # Normalize the mesh
     scale = np.max(np.linalg.norm(mesh.vertices, axis=1))
     mesh.vertices /= scale
 
-    return mesh
+    # Set up optimization bounds
+    bounds_x = (mesh.bounds[0][0], mesh.bounds[1][0])
+    bounds_y = (mesh.bounds[0][1], mesh.bounds[1][1])
+    bounds_z = (mesh.bounds[0][2], mesh.bounds[1][2])
+    radius_range = (0.05, 0.3)
+    height_range = (0.1, 0.6)
 
-def extract_submesh_within_cylinder(mesh, center, radius, height, orientation=np.array([0, 1, 0])):
-    """
-    Extract a submesh within a specified cylinder aligned along a given orientation.
+    bounds = [
+        bounds_x,  # x
+        bounds_y,  # y
+        bounds_z,  # z
+        radius_range,  # radius
+        height_range   # height
+    ]
 
-    Parameters:
-        mesh (trimesh.Trimesh): The original mesh.
-        center (array-like): (x, y, z) coordinates of the cylinder center.
-        radius (float): Radius of the cylinder.
-        height (float): Height of the cylinder.
-        orientation (np.ndarray): Orientation vector of the cylinder axis.
-
-    Returns:
-        trimesh.Trimesh or None: The extracted submesh or None if invalid.
-    """
-    # Normalize the orientation vector
-    orientation = orientation / np.linalg.norm(orientation)
-
-    # Compute rotation matrix to align the cylinder axis with the y-axis
-    y_axis = np.array([0, 1, 0])
-    if np.allclose(orientation, y_axis):
-        rotation_matrix = np.eye(3)
-    else:
-        v = np.cross(orientation, y_axis)
-        s = np.linalg.norm(v)
-        c = np.dot(orientation, y_axis)
-        if s == 0:
-            rotation_matrix = np.eye(3)
-        else:
-            vx = np.array([[0, -v[2], v[1]],
-                           [v[2], 0, -v[0]],
-                           [-v[1], v[0], 0]])
-            rotation_matrix = np.eye(3) + vx + np.matmul(vx, vx) * ((1 - c) / (s ** 2))
-
-    # Rotate vertices to align with y-axis
-    rotated_vertices = (mesh.vertices - center).dot(rotation_matrix)
-
-    # Define cylinder bounds
-    lower_y, upper_y = -height / 2, height / 2
-    within_radius = (rotated_vertices[:, 0] ** 2 + rotated_vertices[:, 2] ** 2) <= radius ** 2
-    within_height = (rotated_vertices[:, 1] >= lower_y) & (rotated_vertices[:, 1] <= upper_y)
-    within_cylinder = within_radius & within_height
-    indices = np.where(within_cylinder)[0]
-
-    if indices.size == 0:
-        return None
-
-    # Extract faces where all vertices are within the cylinder
-    faces = mesh.faces
-    mask = np.all(np.isin(faces, indices), axis=1)
-    sub_faces = faces[mask]
-
-    if sub_faces.size == 0:
-        return None
-
-    sub_vertices = rotated_vertices[indices]
-
-    # Reindex faces
-    index_map = {old_idx: new_idx for new_idx, old_idx in enumerate(indices)}
-    reindexed_faces = np.vectorize(index_map.get)(sub_faces)
-
-    try:
-        sub_mesh = trimesh.Trimesh(vertices=sub_vertices, faces=reindexed_faces, process=False)
-        return sub_mesh
-    except Exception as e:
-        print(f"Error creating submesh: {e}")
-        return None
-
-def loss_function(params, mesh, target_invariants):
-    """
-    Calculate the loss based on how closely the submesh invariants match target invariants.
-
-    Parameters:
-        params (array-like): [x, y, z, radius, height] parameters of the cylinder.
-        mesh (trimesh.Trimesh): The original mesh.
-        target_invariants (dict): Target primitive invariants.
-
-    Returns:
-        float: The computed loss.
-    """
-    x, y, z, radius, height = params
-    position = np.array([x, y, z])
-
-    # Extract submesh within the cylinder
-    orientation = np.array([0, 1, 0])  # Assuming cylinders aligned along y-axis
-    sub_mesh = extract_submesh_within_cylinder(mesh, position, radius, height, orientation)
-
-    if sub_mesh is None or len(sub_mesh.vertices) < 50:
-        return 1e6  # Penalize invalid or small submeshes
-
-    # Compute primitive invariants of the submesh
-    invariants = compute_primitive_invariants(sub_mesh.vertices)
-
-    # Compute loss as the sum of normalized absolute differences
-    loss = 0.0
-    for key in target_invariants:
-        if 'mean' in key:
-            invariant_key = key.replace('_mean', '')
-            loss += np.abs(invariants[invariant_key] - target_invariants[key]['mean']) / target_invariants[key]['std']
-
-    return loss
-
-def get_reference_cylinder_invariants():
-    """
-    Compute the primitive invariants of a reference cylinder.
-
-    Returns:
-        dict: Primitive invariants with mean and standard deviation for each invariant.
-    """
-    primitives = get_reference_cylinder_primitive_invariants()
-    # Assuming some standard deviation based on expected variation
-    # These values can be adjusted based on empirical observations
-    target_invariants = {
-        'IP1': {'mean': primitives['IP1'], 'std': 0.1},
-        'IP2': {'mean': primitives['IP2'], 'std': 0.1},
-        'IP3': {'mean': primitives['IP3'], 'std': 0.1},
-        'IP4': {'mean': primitives['IP4'], 'std': 0.1},
-        'IP5': {'mean': primitives['IP5'], 'std': 0.1},
-        'IP6': {'mean': primitives['IP6'], 'std': 0.1},
-        'IP7': {'mean': primitives['IP7'], 'std': 0.1},
-    }
-    return target_invariants
-
-def find_best_cylinders(mesh, target_invariants, bounds, max_cylinders=5, error_threshold=10.0):
-    """
-    Detect multiple cylinders in the mesh that match the target invariants using optimization.
-
-    Parameters:
-        mesh (trimesh.Trimesh): The original mesh.
-        target_invariants (dict): Target primitive invariants with mean and standard deviation.
-        bounds (list of tuples): Optimization bounds for [x, y, z, radius, height].
-        max_cylinders (int): Maximum number of cylinders to detect.
-        error_threshold (float): Maximum acceptable loss to consider a detection valid.
-
-    Returns:
-        list of dict: Detected cylinders with their mesh and moments.
-    """
+    target_invariants = get_reference_invariants()
     detected = []
-    search_mesh = mesh.copy()
+    remaining_mesh = mesh.copy()
 
     for i in range(max_cylinders):
-        print(f"Optimizing for cylinder {i+1}...")
+        print(f"Searching for cylinder {i+1}...")
+
         result = differential_evolution(
-            loss_function,
+            optimization_loss,
             bounds,
-            args=(search_mesh, target_invariants),
-            strategy='best1bin',
-            maxiter=100,
-            popsize=15,
+            args=(remaining_mesh, target_invariants),
+            maxiter=200,       # Increased iterations for better convergence
+            popsize=20,        # Increased population size
             tol=1e-6,
             mutation=(0.5, 1),
             recombination=0.7,
-            polish=True,
-            disp=False
+            workers=-1         # Utilize all available CPU cores
         )
 
         if result.fun > error_threshold:
-            print(f"No further cylinders detected. Last error: {result.fun:.4f}")
+            print(f"No more cylinders found (error: {result.fun:.2f})")
             break
 
-        x, y, z, radius, height = result.x
-        position = np.array([x, y, z])
-        print(f"Detected cylinder {i+1}: Position = {position}, Radius = {radius:.4f}, Height = {height:.4f}, Error = {result.fun:.4f}")
-
-        # Extract the submesh corresponding to the detected cylinder
-        orientation = np.array([0, 1, 0])  # Assuming cylinders aligned along y-axis
-        sub_mesh = extract_submesh_within_cylinder(search_mesh, position, radius, height, orientation)
-
-        if sub_mesh is None or len(sub_mesh.vertices) < 50:
-            print("Failed to extract submesh.")
+        submesh = extract_cylinder_submesh(remaining_mesh, result.x)
+        if submesh is None:
+            print("Optimization found a solution, but failed to extract submesh.")
             continue
 
-        # Compute primitive invariants
-        invariants = compute_primitive_invariants(sub_mesh.vertices)
-
         detected.append({
-            'mesh': sub_mesh,
-            'position': position,
-            'radius': radius,
-            'height': height,
-            'invariants': invariants,
+            'mesh': submesh,
+            'parameters': result.x,
             'error': result.fun
         })
-        print(f"Submesh Invariants: {invariants}")
+        print(f"Found cylinder {i+1}:")
+        print(f"  Center = ({result.x[0]:.2f}, {result.x[1]:.2f}, {result.x[2]:.2f})")
+        print(f"  Radius = {result.x[3]:.2f}")
+        print(f"  Height = {result.x[4]:.2f}")
+        print(f"  Error  = {result.fun:.2f}\n")
 
-        # Remove the detected cylinder from the search_mesh to find other cylinders
-        search_mesh = subtract_mesh(search_mesh, sub_mesh)
-
-        if search_mesh.is_empty:
-            print("No more mesh left to search.")
+        # Remove detected region from search space
+        try:
+            remaining_mesh = remaining_mesh.difference(submesh, engine='scad')
+            if remaining_mesh.is_empty:
+                print("All cylinders have been detected.")
+                break
+        except Exception as e:
+            print(f"Error removing detected cylinder from mesh: {e}")
             break
 
     return detected
 
-def subtract_mesh(original_mesh, sub_mesh):
+def visualize_results(original_mesh, cylinders):
     """
-    Subtract a submesh from the original mesh to avoid re-detection.
-
-    Parameters:
-        original_mesh (trimesh.Trimesh): The original mesh.
-        sub_mesh (trimesh.Trimesh): The submesh to subtract.
-
-    Returns:
-        trimesh.Trimesh: The remaining mesh after subtraction.
-    """
-    try:
-        remaining = original_mesh.difference(sub_mesh, engine='scad')
-        return remaining
-    except Exception as e:
-        print(f"Error subtracting mesh: {e}")
-        return original_mesh
-
-def visualize_cylinders(original_mesh, detected_cylinders):
-    """
-    Visualize the original mesh and detected cylinders with distinct colors.
-
-    Parameters:
-        original_mesh (trimesh.Trimesh): The original vehicle mesh.
-        detected_cylinders (list of dict): Detected cylinders with their meshes and properties.
+    Visualize original mesh and detected cylinders.
     """
     plotter = pv.Plotter()
 
-    # Add original mesh in light gray
-    vehicle_pv = pv.wrap(original_mesh)
-    plotter.add_mesh(vehicle_pv, color='lightgray', opacity=0.3, label='Vehicle')
+    # Show original mesh semi-transparent
+    plotter.add_mesh(
+        pv.wrap(original_mesh), 
+        color='lightgray',
+        opacity=0.3,
+        label='Original Mesh'
+    )
 
-    # Define distinct colors for detected cylinders
-    color_palette = ['red', 'green', 'blue', 'yellow', 'magenta', 'cyan', 'orange', 'purple', 'brown', 'pink']
+    # Define a list of distinct colors for cylinders
+    colors = ['red', 'green', 'blue', 'yellow', 'purple', 'cyan', 'magenta', 'orange']
 
-    for idx, cylinder in enumerate(detected_cylinders):
-        color = color_palette[idx % len(color_palette)]
-        cyl_mesh = cylinder['mesh']
-        # Convert trimesh to pyvista PolyData
-        if not cyl_mesh.is_watertight:
-            cyl_mesh = cyl_mesh.convex_hull
-        pv_faces = np.hstack([np.full((cyl_mesh.faces.shape[0], 1), 3), cyl_mesh.faces]).astype(np.int32)
-        cyl_pv = pv.PolyData(cyl_mesh.vertices, pv_faces)
-        plotter.add_mesh(cyl_pv, color=color, label=f"Cylinder {idx+1}")
+    # Show detected cylinders
+    for i, cyl in enumerate(cylinders):
+        color = colors[i % len(colors)]
+        plotter.add_mesh(
+            pv.wrap(cyl['mesh']),
+            color=color,
+            label=f'Cylinder {i+1}',
+            opacity=0.8
+        )
 
-    # Enhance visualization
     plotter.add_legend()
-    plotter.add_title("Detected Cylinders in Vehicle Mesh")
+    plotter.add_axes()
     plotter.show()
 
 def main():
-    # Define target invariants (computed from a reference cylinder)
-    target_invariants = get_reference_cylinder_invariants()
-
-    # Specify the path to your mesh file
+    # Load mesh
     mesh_file = "vehicle.obj"  # Replace with your mesh file path
-
-    # Load and preprocess the mesh
-    mesh = load_and_preprocess_mesh(mesh_file)
-    if mesh is None:
+    try:
+        mesh = trimesh.load(mesh_file)
+        if not isinstance(mesh, trimesh.Trimesh):
+            mesh = mesh.dump().sum()  # Combine multiple meshes if necessary
+    except Exception as e:
+        print(f"Error loading mesh '{mesh_file}': {e}")
         return
 
-    # Define optimization bounds based on the mesh's bounding box
-    bbox_min, bbox_max = mesh.bounds
-    # Assuming the cylinder radius and height should be within reasonable fractions of the mesh size
-    radius_bounds = (0.01, 0.2)  # Adjust based on expected cylinder sizes
-    height_bounds = (0.05, 0.5)  # Adjust based on expected cylinder heights
-    bounds = [
-        (bbox_min[0], bbox_max[0]),  # x
-        (bbox_min[1], bbox_max[1]),  # y
-        (bbox_min[2], bbox_max[2]),  # z
-        radius_bounds,                # radius
-        height_bounds                 # height
-    ]
+    print(f"Loaded mesh '{mesh_file}' with {len(mesh.vertices)} vertices and {len(mesh.faces)} faces.\n")
 
-    print(f"Normalized Mesh Bounding Box: Min {bbox_min}, Max {bbox_max}")
-    print(f"Optimization Bounds:")
-    print(f"  X: {bounds[0]}")
-    print(f"  Y: {bounds[1]}")
-    print(f"  Z: {bounds[2]}")
-    print(f"  Radius: {bounds[3]}")
-    print(f"  Height: {bounds[4]}")
-
-    # Detect cylinders using optimization
-    detected_cylinders = find_best_cylinders(
-        mesh=mesh,
-        target_invariants=target_invariants,
-        bounds=bounds,
-        max_cylinders=10,
-        error_threshold=10.0  # Adjusted threshold based on desired sensitivity
+    # Find cylindrical regions
+    cylinders = detect_cylinders(
+        mesh,
+        max_cylinders=5,
+        error_threshold=10.0
     )
 
-    if not detected_cylinders:
-        print("No cylinders detected.")
+    if not cylinders:
+        print("No cylindrical regions found.")
         return
 
-    # Visualize the detected cylinders
-    visualize_cylinders(mesh, detected_cylinders)
+    print(f"Detected {len(cylinders)} cylinder(s).")
+
+    # Optionally, print out the invariants for debugging
+    print("\nReference Invariants:")
+    reference_invariants = get_reference_invariants()
+    for k, v in reference_invariants.items():
+        print(f"  {k}: mean = {v['mean']:.4f}, std = {v['std']:.4f}")
+    print("\nDetected Cylinder Invariants:")
+    for i, cyl in enumerate(cylinders, start=1):
+        cyl_invariants = compute_primitive_invariants(cyl['mesh'].vertices)
+        print(f"  Cylinder {i}:")
+        for k, v in cyl_invariants.items():
+            print(f"    {k}: {v:.4f}")
+        print()
+
+    # Visualize results
+    visualize_results(mesh, cylinders)
 
 if __name__ == "__main__":
     main()
